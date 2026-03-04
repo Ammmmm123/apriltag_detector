@@ -7,12 +7,19 @@ AprilTagDetectorNode：订阅 /camera/image_raw，
 
 发布话题
 --------
-/apriltag/detections        geometry_msgs/PoseArray      所有标签位姿
-/apriltag/pose              geometry_msgs/PoseStamped    目标标签位姿
-/apriltag/relative_position geometry_msgs/Vector3Stamped 位置 (x,y,z) 单位 m
-/apriltag/euler_angles      geometry_msgs/Vector3Stamped 欧拉角 (r,p,y) 单位 rad
-/apriltag/distance          std_msgs/Float64             直线距离 m
-/camera/image_debug         sensor_msgs/Image             调试叠加图像
+/apriltag/detections        geometry_msgs/PoseArray
+    所有标签位姿（按检测顺序）
+
+/apriltag/pose              geometry_msgs/PoseStamped
+/apriltag/relative_position geometry_msgs/Vector3Stamped
+/apriltag/euler_angles      geometry_msgs/Vector3Stamped
+/apriltag/distance          std_msgs/Float64
+    每个检测到的标签均会向以上话题发布一条消息。
+    消息的 header.frame_id = "tag_<N>"(如 tag_254)，
+    订阅者通过读取 frame_id 即可判断属于哪个码。
+
+/camera/image_debug         sensor_msgs/Image
+    调试叠加图像（所有码均标注 ID/位置/距离/坐标轴）
 """
 
 import os
@@ -51,9 +58,10 @@ class AprilTagDetectorNode(Node):
     ROS2 参数
     ---------
     tag_family          : str   标签家族（默认 'tag36h11'）
-    tag_size            : float 标签实际边长，单位：米（默认 0.133）
+    tag_size            : float 默认标签边长，单位：米（默认 0.133）
+    tag_size_map        : str   按 ID 指定边长，格式 "id:size,id:size"，例如 "4:0.133,7:0.080"
+                                未在表中的 ID 使用 tag_size 作为回退值
     max_hamming         : int   最大汉明距离（默认 0）
-    target_tag_id       : int   目标标签 ID（-1 = 追踪最近标签）
     publish_debug_image : bool  是否发布调试图像（默认 True）
     camera_params_file  : str   相机内参文件路径
     frame_id            : str   发布帧 ID（默认 "camera_optical_frame"）
@@ -77,8 +85,8 @@ class AprilTagDetectorNode(Node):
         # ── 声明参数 ────────────────────────────────────────────────────
         self.declare_parameter('tag_family', 'tag36h11')
         self.declare_parameter('tag_size', 0.133)
+        self.declare_parameter('tag_size_map', '254:0.175,80:0.022')   # 例如 "4:0.133,7:0.080"
         self.declare_parameter('max_hamming', 0)
-        self.declare_parameter('target_tag_id', 4)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('frame_id', 'camera_optical_frame')
 
@@ -92,10 +100,35 @@ class AprilTagDetectorNode(Node):
         self._tag_family      = self.get_parameter('tag_family').value
         self._tag_size        = self.get_parameter('tag_size').value
         self._max_hamming     = self.get_parameter('max_hamming').value
-        self._target_id       = self.get_parameter('target_tag_id').value
         self._pub_debug       = self.get_parameter('publish_debug_image').value
         self._frame_id        = self.get_parameter('frame_id').value
         self._cfg_path        = self.get_parameter('camera_params_file').value
+
+        # 解析 tag_size_map："id:size,id:size" → {int: float}
+        self._tag_size_dict: dict[int, float] = {}
+        raw_map = self.get_parameter('tag_size_map').value.strip()
+        if raw_map:
+            for entry in raw_map.split(','):
+                entry = entry.strip()
+                if ':' in entry:
+                    id_str, sz_str = entry.split(':', 1)
+                    try:
+                        self._tag_size_dict[int(id_str.strip())] = \
+                            float(sz_str.strip())
+                    except ValueError:
+                        self.get_logger().warn(
+                            f'tag_size_map 解析失败，忽略条目："{entry}"'
+                        )
+        if self._tag_size_dict:
+            self.get_logger().info(
+                'tag_size_map：' +
+                ', '.join(f'ID {k}→{v} m'
+                          for k, v in self._tag_size_dict.items())
+            )
+        else:
+            self.get_logger().info(
+                f'tag_size_map 未设置，所有标签使用统一尺寸 {self._tag_size} m'
+            )
 
         # ── 相机内参 ─────────────────────────────────────────────────────
         self._camera_matrix, self._dist_coeffs = self._load_camera_params(
@@ -121,10 +154,12 @@ class AprilTagDetectorNode(Node):
             decode_sharpening=0.25,
             debug=0,
         )
+        tracked_ids = list(self._tag_size_dict.keys()) if self._tag_size_dict \
+            else ['全部']
         self.get_logger().info(
             f'AprilTag 检测器初始化：family={self._tag_family}  '
-            f'tag_size={self._tag_size} m  '
-            f'target_id={self._target_id}'
+            f'默认 tag_size={self._tag_size} m  '
+            f'检测目标 ID：{tracked_ids}'
         )
 
         # ── QoS ─────────────────────────────────────────────────────────
@@ -150,6 +185,7 @@ class AprilTagDetectorNode(Node):
 
         # ── 发布器 ───────────────────────────────────────────────────────
         self._pub_poses    = self.create_publisher(PoseArray,      '/apriltag/detections',        qos_pub)
+        # 所有检测到的码均向以下话题发布，frame_id="tag_<N>"编码标签 ID
         self._pub_pose     = self.create_publisher(PoseStamped,    '/apriltag/pose',               qos_pub)
         self._pub_position = self.create_publisher(Vector3Stamped, '/apriltag/relative_position',  qos_pub)
         self._pub_euler    = self.create_publisher(Vector3Stamped, '/apriltag/euler_angles',       qos_pub)
@@ -196,9 +232,11 @@ class AprilTagDetectorNode(Node):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # AprilTag 检测
+        # estimate_tag_pose=False：角点检测与 tag_size 无关，内置位姿估计
+        # 只支持单一尺寸，多尺寸场景下由后续 solve_pnp 按各码真实尺寸解算。
         detections = self._detector.detect(
             gray,
-            estimate_tag_pose=True,
+            estimate_tag_pose=False,
             camera_params=self._camera_params,
             tag_size=self._tag_size,
         )
@@ -210,9 +248,6 @@ class AprilTagDetectorNode(Node):
                 self._publish_debug_image(frame, [], stamp)
             return
 
-        # 选取目标标签
-        target = self._select_target(detections)
-
         # 发布所有标签 PoseArray
         pose_array = PoseArray()
         pose_array.header.stamp    = stamp
@@ -223,46 +258,32 @@ class AprilTagDetectorNode(Node):
             )
         self._pub_poses.publish(pose_array)
 
-        # 发布目标标签详细信息
-        if target is not None:
-            self._publish_target(target, stamp)
+        # 每个检测到的标签均发布到同一套话题，frame_id 编码 tag ID
+        for det in detections:
+            self._publish_detection(det, stamp)
 
         # 调试图像
         if self._pub_debug:
-            self._publish_debug_image(frame, detections, stamp, target)
+            self._publish_debug_image(frame, detections, stamp)
 
     # ------------------------------------------------------------------
-    # 核心逻辑
+    # 辅助方法
     # ------------------------------------------------------------------
 
-    def _select_target(self, detections: list):
+    def _get_tag_size(self, tag_id: int) -> float:
+        """返回指定 tag_id 对应的实际边长（米）；未配置则用默认值。"""
+        return self._tag_size_dict.get(tag_id, self._tag_size)
+
+    def _publish_detection(self, det, stamp) -> None:
         """
-        从所有检测中选取目标标签。
-        - target_id >= 0：优先匹配指定 ID
-        - target_id == -1：选距离最近的标签
+        对单个检测结果发布到公共话题。
+        header.frame_id = "tag_<N>" 编码标签 ID，订阅者通过读取 frame_id 即可区分不同码。
         """
-        if self._target_id >= 0:
-            for d in detections:
-                if d.tag_id == self._target_id:
-                    return d
-            return None  # 未找到指定 ID
-
-        # 选最近（tvec 模最小）
-        def _dist(d):
-            if d.pose_t is not None:
-                return float(np.linalg.norm(d.pose_t))
-            return float('inf')
-
-        return min(detections, key=_dist)
-
-    def _publish_target(self, det, stamp) -> None:
-        """解算并发布目标标签的位姿、位置、欧拉角、距离。"""
+        tag_size = self._get_tag_size(det.tag_id)
         try:
-            rvec, tvec = self._pose_estimator.solve_pnp(
-                det.corners, self._tag_size
-            )
+            rvec, tvec = self._pose_estimator.solve_pnp(det.corners, tag_size)
         except RuntimeError as e:
-            self.get_logger().warn(f'PnP 解算失败：{e}')
+            self.get_logger().warn(f'PnP 解算失败 ID={det.tag_id}：{e}')
             return
 
         qx, qy, qz, qw = self._pose_estimator.rvec_to_quaternion(rvec)
@@ -270,10 +291,12 @@ class AprilTagDetectorNode(Node):
         tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
         distance = PoseEstimator.translation_to_distance(tvec)
 
-        # PoseStamped
+        # frame_id 编码 tag ID，订阅者通过此字段区分不同标签
+        tag_frame = f'tag_{det.tag_id}'
+
         ps = PoseStamped()
         ps.header.stamp    = stamp
-        ps.header.frame_id = self._frame_id
+        ps.header.frame_id = tag_frame
         ps.pose.position.x = tx
         ps.pose.position.y = ty
         ps.pose.position.z = tz
@@ -283,25 +306,22 @@ class AprilTagDetectorNode(Node):
         ps.pose.orientation.w = qw
         self._pub_pose.publish(ps)
 
-        # 相对位置 Vector3Stamped
         pos_msg = Vector3Stamped()
         pos_msg.header.stamp    = stamp
-        pos_msg.header.frame_id = self._frame_id
+        pos_msg.header.frame_id = tag_frame
         pos_msg.vector.x = tx
         pos_msg.vector.y = ty
         pos_msg.vector.z = tz
         self._pub_position.publish(pos_msg)
 
-        # 欧拉角 Vector3Stamped（roll=x, pitch=y, yaw=z）
         euler_msg = Vector3Stamped()
         euler_msg.header.stamp    = stamp
-        euler_msg.header.frame_id = self._frame_id
+        euler_msg.header.frame_id = tag_frame
         euler_msg.vector.x = roll
         euler_msg.vector.y = pitch
         euler_msg.vector.z = yaw
         self._pub_euler.publish(euler_msg)
 
-        # 距离 Float64
         dist_msg = Float64()
         dist_msg.data = distance
         self._pub_distance.publish(dist_msg)
@@ -316,21 +336,25 @@ class AprilTagDetectorNode(Node):
 
     def _detection_to_pose(self, det) -> Pose:
         """
-        将单个检测结果转换为 Pose 消息（使用 pupil-apriltags 内置位姿）。
+        将单个检测结果转换为 Pose 消息。
+        使用 PnP + 该标签对应的实际尺寸，确保多尺寸标签位姿均准确。
         """
         pose = Pose()
-        if det.pose_t is not None:
-            pose.position.x = float(det.pose_t[0])
-            pose.position.y = float(det.pose_t[1])
-            pose.position.z = float(det.pose_t[2])
-        if det.pose_R is not None:
-            R = np.array(det.pose_R, dtype=np.float64)
-            rvec, _ = cv2.Rodrigues(R)
+        tag_size = self._get_tag_size(det.tag_id)
+        try:
+            rvec, tvec = self._pose_estimator.solve_pnp(det.corners, tag_size)
+            pose.position.x = float(tvec[0])
+            pose.position.y = float(tvec[1])
+            pose.position.z = float(tvec[2])
             qx, qy, qz, qw = self._pose_estimator.rvec_to_quaternion(rvec)
             pose.orientation.x = qx
             pose.orientation.y = qy
             pose.orientation.z = qz
             pose.orientation.w = qw
+        except Exception as e:
+            self.get_logger().warn(
+                f'_detection_to_pose PnP 失败 ID={det.tag_id}：{e}'
+            )
         return pose
 
     # ------------------------------------------------------------------
@@ -338,13 +362,12 @@ class AprilTagDetectorNode(Node):
     # ------------------------------------------------------------------
 
     def _publish_debug_image(self, frame: np.ndarray, detections: list,
-                              stamp, target=None) -> None:
-        """在图像上叠加检测信息并发布到 /camera/image_debug。"""
+                              stamp) -> None:
+        """在图像上叠加检测信息并发布到 /camera/image_debug。所有码均显示位置/距离/坐标轴。"""
         debug = frame.copy()
         for det in detections:
             corners = det.corners.astype(int)
-            is_target = (target is not None and det.tag_id == target.tag_id)
-            color = self._COLOR_TARGET if is_target else self._COLOR_BBOX
+            color = self._COLOR_BBOX
 
             # 绘制边框
             cv2.polylines(debug, [corners], True, color, 2)
@@ -358,38 +381,34 @@ class AprilTagDetectorNode(Node):
             cv2.putText(
                 debug, f'ID:{det.tag_id}',
                 (corners[0][0], corners[0][1] - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, self._COLOR_TEXT, 2
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
             )
 
-            # 目标标签显示位置和距离
-            if is_target and det.pose_t is not None:
-                tx = float(det.pose_t[0])
-                ty = float(det.pose_t[1])
-                tz = float(det.pose_t[2])
-                dist = float(np.linalg.norm(det.pose_t))
+            # 所有码均尝试解算 PnP 并显示位置/距离
+            try:
+                _sz = self._get_tag_size(det.tag_id)
+                rvec, tvec = self._pose_estimator.solve_pnp(det.corners, _sz)
+                tx = float(tvec[0])
+                ty = float(tvec[1])
+                tz = float(tvec[2])
+                dist = float(np.linalg.norm(tvec))
                 lines = [
-                    f'dist={dist:.2f}m',
-                    f'x={tx:.2f} y={ty:.2f} z={tz:.2f}',
+                    f'dist={dist:.3f}m',
+                    f'x={tx:.3f} y={ty:.3f}',
+                    f'z={tz:.3f}',
                 ]
                 y0 = cy_px + 20
                 for i, line in enumerate(lines):
                     cv2.putText(
                         debug, line,
                         (cx_px - 60, y0 + i * 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        self._COLOR_TARGET, 2
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        color, 2
                     )
-
-                # 坐标轴（仅当内参有效时）
-                try:
-                    rvec, tvec = self._pose_estimator.solve_pnp(
-                        det.corners, self._tag_size
-                    )
-                    self._pose_estimator.draw_axis(
-                        debug, rvec, tvec, self._tag_size * 0.5
-                    )
-                except Exception:
-                    pass
+                # 坐标轴
+                self._pose_estimator.draw_axis(debug, rvec, tvec, _sz * 0.5)
+            except Exception:
+                pass
 
         # 左上角检测统计
         cv2.putText(

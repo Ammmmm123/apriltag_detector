@@ -12,7 +12,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         # ── 可调参数 ──────────────────────────────────────────────────
-        DeclareLaunchArgument('device_id',   default_value='0'),
         DeclareLaunchArgument('width',       default_value='1280'),
         DeclareLaunchArgument('height',      default_value='720'),
         DeclareLaunchArgument('fps',          default_value='30'),
@@ -21,10 +20,11 @@ def generate_launch_description():
         # TODO: 将 -1 替换为实测超焦距值（对准 2~3m 处，AF 收敛后读取）
         # 命令：v4l2-ctl -d /dev/video0 --get-ctrl=focus_absolute
         DeclareLaunchArgument('focus_absolute', default_value='580'),
-        DeclareLaunchArgument('focus_auto',     default_value='false'),
-        DeclareLaunchArgument('tag_family',  default_value='tag36h11'),
-        DeclareLaunchArgument('tag_size',    default_value='0.133'),
-        DeclareLaunchArgument('target_tag_id', default_value='4'),
+        DeclareLaunchArgument('focus_auto',     default_value='true'),
+        DeclareLaunchArgument('tag_family',    default_value='tag36h11'),
+        DeclareLaunchArgument('tag_size',      default_value='0.175'),   # 未在 tag_size_map 中的 ID 回退值
+        # ID 254: 大码 0.175 m；ID 80: 小码 0.022 m
+        DeclareLaunchArgument('tag_size_map',  default_value='254:0.175,80:0.022'),
         DeclareLaunchArgument('publish_debug_image', default_value='true'),
         DeclareLaunchArgument('camera_params_file',  default_value=default_camera_params),
 
@@ -34,7 +34,7 @@ def generate_launch_description():
             executable='camera_node',
             name='usb_camera_node',
             parameters=[{
-                'device_id':          LaunchConfiguration('device_id'),
+                'device_id':          1,          # /dev/video1
                 'width':              LaunchConfiguration('width'),
                 'height':             LaunchConfiguration('height'),
                 'fps':                LaunchConfiguration('fps'),
@@ -54,7 +54,7 @@ def generate_launch_description():
             parameters=[{
                 'tag_family':         LaunchConfiguration('tag_family'),
                 'tag_size':           LaunchConfiguration('tag_size'),
-                'target_tag_id':      LaunchConfiguration('target_tag_id'),
+                'tag_size_map':       LaunchConfiguration('tag_size_map'),
                 'publish_debug_image': LaunchConfiguration('publish_debug_image'),
                 'camera_params_file': LaunchConfiguration('camera_params_file'),
             }],

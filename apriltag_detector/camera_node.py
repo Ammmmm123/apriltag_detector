@@ -33,8 +33,8 @@ class UsbCameraNode(Node):
     ROS2 参数
     ---------
     device_id          : int   摄像头设备号（默认 0 → /dev/video0）
-    width              : int   图像宽度像素（默认 1920）
-    height             : int   图像高度像素（默认 1080）
+    width              : int   图像宽度像素（默认 1280）
+    height             : int   图像高度像素（默认 720）
     fps                : int   目标帧率（默认 30）
     use_mjpg           : bool  是否强制使用 MJPG 格式（默认 True）
     camera_params_file : str   相机内参 YAML 路径
@@ -45,7 +45,7 @@ class UsbCameraNode(Node):
         super().__init__('usb_camera_node')
 
         # ── 声明参数 ───────────────────────────────────────────────────
-        self.declare_parameter('device_id', 0)
+        self.declare_parameter('device_id', 1)
         self.declare_parameter('width', 1280)
         self.declare_parameter('height', 720)
         self.declare_parameter('fps', 30)
@@ -53,7 +53,7 @@ class UsbCameraNode(Node):
         self.declare_parameter('frame_id', 'camera_optical_frame')
         # 对焦锁定参数：-1 表示不干预（保持自动对焦）
         self.declare_parameter('focus_absolute', 580)
-        self.declare_parameter('focus_auto', False)
+        self.declare_parameter('focus_auto', True)
 
         default_cfg = os.path.join(
             get_package_share_directory('apriltag_detector'),
@@ -117,7 +117,20 @@ class UsbCameraNode(Node):
         dev = f'/dev/video{self._device_id}'
 
         if self._focus_auto:
-            self.get_logger().info('对焦模式：自动对焦（未锁定）')
+            # 主动写入寄存器，确保自动对焦真正开启（防止上次会话残留关闭状态）
+            for ctrl in ('focus_automatic_continuous', 'auto_focus'):
+                ret = subprocess.run(
+                    ['v4l2-ctl', '-d', dev, f'--set-ctrl={ctrl}=1'],
+                    capture_output=True, text=True
+                )
+                if ret.returncode == 0:
+                    self.get_logger().info(f'已通过 {ctrl}=1 开启自动对焦')
+                    break
+            else:
+                self.get_logger().warn(
+                    '未能开启自动对焦，请手动执行：\n'
+                    f'  v4l2-ctl -d {dev} --set-ctrl=focus_automatic_continuous=1'
+                )
             return
 
         # 关闭自动对焦
@@ -160,12 +173,14 @@ class UsbCameraNode(Node):
 
     def _configure_camera(self) -> None:
         """打开并配置 USB UVC 摄像头。"""
+        dev_path = f'/dev/video{self._device_id}'
+        # 优先用整数索引（更兼容），字符串路径在部分 OpenCV 版本下 CAP_V4L2 不支持
         cap = cv2.VideoCapture(self._device_id, cv2.CAP_V4L2)
         if not cap.isOpened():
             self.get_logger().error(
-                f'无法打开摄像头 /dev/video{self._device_id}'
+                f'无法打开摄像头 {dev_path}'
             )
-            raise RuntimeError(f'无法打开摄像头 /dev/video{self._device_id}')
+            raise RuntimeError(f'无法打开摄像头 {dev_path}')
 
         # 强制使用 MJPG，带宽更低、帧率更高
         if self._use_mjpg:
