@@ -184,7 +184,8 @@ class AprilTagDetectorNode(Node):
         )
 
         # ── 发布器 ───────────────────────────────────────────────────────
-        self._pub_poses    = self.create_publisher(PoseArray,      '/apriltag/detections',        qos_pub)
+        # self._pub_poses    = self.create_publisher(PoseArray,      '/apriltag/detections',        qos_pub)
+        
         # 所有检测到的码均向以下话题发布，frame_id="tag_<N>"编码标签 ID
         self._pub_pose     = self.create_publisher(PoseStamped,    '/apriltag/pose',               qos_pub)
         self._pub_position = self.create_publisher(Vector3Stamped, '/apriltag/relative_position',  qos_pub)
@@ -248,15 +249,15 @@ class AprilTagDetectorNode(Node):
                 self._publish_debug_image(frame, [], stamp)
             return
 
-        # 发布所有标签 PoseArray
-        pose_array = PoseArray()
-        pose_array.header.stamp    = stamp
-        pose_array.header.frame_id = self._frame_id
-        for det in detections:
-            pose_array.poses.append(
-                self._detection_to_pose(det)
-            )
-        self._pub_poses.publish(pose_array)
+        # 发布所有标签 PoseArray  （按检测顺序，未区分 ID，供需要批量处理的订阅者使用）
+        # pose_array = PoseArray()
+        # pose_array.header.stamp    = stamp
+        # pose_array.header.frame_id = self._frame_id
+        # for det in detections:
+        #     pose_array.poses.append(
+        #         self._detection_to_pose(det)
+        #     )
+        # self._pub_poses.publish(pose_array)
 
         # 每个检测到的标签均发布到同一套话题，frame_id 编码 tag ID
         for det in detections:

@@ -34,7 +34,7 @@ def generate_launch_description():
             executable='camera_node',
             name='usb_camera_node',
             parameters=[{
-                'device_id':          1,          # /dev/video1
+                'device_id':          0,          # /dev/video0
                 'width':              LaunchConfiguration('width'),
                 'height':             LaunchConfiguration('height'),
                 'fps':                LaunchConfiguration('fps'),
