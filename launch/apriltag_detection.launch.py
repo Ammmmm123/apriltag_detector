@@ -21,6 +21,11 @@ def generate_launch_description():
         # 命令：v4l2-ctl -d /dev/video0 --get-ctrl=focus_absolute
         DeclareLaunchArgument('focus_absolute', default_value='580'),
         DeclareLaunchArgument('focus_auto',     default_value='true'),
+        # exposure_auto=false 时锁定曝光，彻底消除 cap.read() 随机阻塞 1~3s 的问题
+        # exposure_absolute 单位：100μs，300=30ms≈33fps上限，166=16.6ms≈60fps上限
+        # 读取当前值命令：v4l2-ctl -d /dev/video0 --get-ctrl=exposure_absolute
+        DeclareLaunchArgument('exposure_auto',     default_value='true'),
+        DeclareLaunchArgument('exposure_absolute', default_value='300'),
         DeclareLaunchArgument('tag_family',    default_value='tag36h11'),
         DeclareLaunchArgument('tag_size',      default_value='0.175'),   # 未在 tag_size_map 中的 ID 回退值
         # ID 254: 大码 0.175 m；ID 80: 小码 0.022 m
@@ -41,6 +46,8 @@ def generate_launch_description():
                 'use_mjpg':           True,
                 'focus_absolute':     LaunchConfiguration('focus_absolute'),
                 'focus_auto':         LaunchConfiguration('focus_auto'),
+                'exposure_auto':      LaunchConfiguration('exposure_auto'),
+                'exposure_absolute':  LaunchConfiguration('exposure_absolute'),
                 'camera_params_file': LaunchConfiguration('camera_params_file'),
             }],
             output='screen',

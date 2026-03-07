@@ -55,6 +55,12 @@ class UsbCameraNode(Node):
         # 对焦锁定参数：-1 表示不干预（保持自动对焦）
         self.declare_parameter('focus_absolute', 580)
         self.declare_parameter('focus_auto', True)
+        # 曝光参数：exposure_auto=False 关闭自动曝光，exposure_absolute 设定固定曝光时间（单位：100μs）
+        # 自动曝光在低光/变光场景下会把曝光时间拉到 1~3s，导致 cap.read() 随机阻塞
+        # 建议：先开自动曝光让相机收敛，读取 exposure_absolute 值，再锁定
+        # 命令：v4l2-ctl -d /dev/video0 --get-ctrl=exposure_absolute
+        self.declare_parameter('exposure_auto', True)    # True=自动曝光，False=手动
+        self.declare_parameter('exposure_absolute', 300) # 单位100μs，300=30ms≈33fps上限
 
         default_cfg = os.path.join(
             get_package_share_directory('apriltag_detector'),
@@ -72,6 +78,8 @@ class UsbCameraNode(Node):
         self._cfg_path      = self.get_parameter('camera_params_file').value
         self._focus_abs     = self.get_parameter('focus_absolute').value
         self._focus_auto    = self.get_parameter('focus_auto').value
+        self._exposure_auto = self.get_parameter('exposure_auto').value
+        self._exposure_abs  = self.get_parameter('exposure_absolute').value
 
         # ── 相机内参 ───────────────────────────────────────────────────
         self._camera_info_msg = self._build_camera_info(self._cfg_path)
@@ -89,6 +97,7 @@ class UsbCameraNode(Node):
         self._bridge    = CvBridge()
         # ── 对焦控制（在 VideoCapture 之前，通过 v4l2-ctl 设置）────────
         self._lock_focus()
+        self._lock_exposure()
         # ── 打开摄像头 ────────────────────────────────────────────────
         self._cap = None
         self._configure_camera()
@@ -106,6 +115,63 @@ class UsbCameraNode(Node):
     # ------------------------------------------------------------------
     # 私有方法
     # ------------------------------------------------------------------
+
+    def _lock_exposure(self) -> None:
+        """
+        通过 v4l2-ctl 锁定曝光，防止自动曝光将曝光时间拉长导致 cap.read() 随机阻塞 1~3s。
+
+        参数说明：
+          exposure_auto     = True  → 保持自动曝光（默认）
+          exposure_auto     = False → 关闭自动曝光，启用手动
+          exposure_absolute = N    → 曝光时间，单位 100μs。
+                                     例：300 = 30ms，对应最高 33fps；
+                                         166 = 16.6ms，对应最高 60fps。
+        """
+        dev = f'/dev/video{self._device_id}'
+
+        if self._exposure_auto:
+            # 确保自动曝光开启（防止上次会话残留手动状态）
+            for val in ('3', '1'):   # 3=aperture priority(UVC), 1=manual off
+                for ctrl in ('exposure_auto',):
+                    ret = subprocess.run(
+                        ['v4l2-ctl', '-d', dev, f'--set-ctrl={ctrl}={val}'],
+                        capture_output=True, text=True
+                    )
+                    if ret.returncode == 0:
+                        self.get_logger().info(f'已开启自动曝光（{ctrl}={val}）')
+                        return
+            self.get_logger().warn('未能开启自动曝光，如帧率过低请设置 exposure_auto:=false')
+            return
+
+        # 关闭自动曝光（UVC 手动模式值为 1）
+        for val in ('1',):
+            ret = subprocess.run(
+                ['v4l2-ctl', '-d', dev, f'--set-ctrl=exposure_auto={val}'],
+                capture_output=True, text=True
+            )
+            if ret.returncode == 0:
+                self.get_logger().info('已关闭自动曝光（手动模式）')
+                break
+        else:
+            self.get_logger().warn('未能关闭自动曝光')
+            return
+
+        # 设置固定曝光时间
+        ret = subprocess.run(
+            ['v4l2-ctl', '-d', dev,
+             f'--set-ctrl=exposure_absolute={self._exposure_abs}'],
+            capture_output=True, text=True
+        )
+        if ret.returncode == 0:
+            self.get_logger().info(
+                f'曝光已锁定：exposure_absolute={self._exposure_abs} '
+                f'({self._exposure_abs * 0.1:.1f}ms)'
+            )
+        else:
+            self.get_logger().warn(
+                f'设置 exposure_absolute 失败：{ret.stderr.strip()}\n'
+                f'请手动执行：v4l2-ctl -d {dev} --set-ctrl=exposure_absolute={self._exposure_abs}'
+            )
 
     def _lock_focus(self) -> None:
         """
@@ -177,15 +243,36 @@ class UsbCameraNode(Node):
     def _configure_camera(self) -> None:
         """打开并配置 USB UVC 摄像头。"""
         dev_path = f'/dev/video{self._device_id}'
-        # 优先用整数索引（更兼容），字符串路径在部分 OpenCV 版本下 CAP_V4L2 不支持
+
+        # 在 VideoCapture 打开之前，用 v4l2-ctl 预设像素格式。
+        # OpenCV 的 cap.set(CAP_PROP_FOURCC) 在部分驱动/版本下对已打开的设备无效，
+        # 而驱动在 open() 时就会锁定格式，因此必须在此之前设置。
+        # 茄子相机流畅而 OpenCV 卡顿，正是因为 OpenCV 默认以 YUYV 打开，
+        # 1280×720 YUYV 每帧 ~1.8MB，USB 2.0 带宽不足以支撑 30fps，
+        # 使用 MJPG 可将带宽降低 90%+，恢复 30fps。
+        if self._use_mjpg:
+            ret = subprocess.run(
+                ['v4l2-ctl', '-d', dev_path,
+                 '--set-fmt-video',
+                 f'width={self._width},height={self._height},pixelformat=MJPG'],
+                capture_output=True, text=True
+            )
+            if ret.returncode == 0:
+                self.get_logger().info(
+                    f'v4l2-ctl 已预设格式：MJPG {self._width}×{self._height}'
+                )
+            else:
+                self.get_logger().warn(
+                    f'v4l2-ctl 预设 MJPG 失败（{ret.stderr.strip()}），'
+                    f'将依赖 OpenCV 设置，可能回退到 YUYV 导致帧率低'
+                )
+
         cap = cv2.VideoCapture(self._device_id, cv2.CAP_V4L2)
         if not cap.isOpened():
-            self.get_logger().error(
-                f'无法打开摄像头 {dev_path}'
-            )
+            self.get_logger().error(f'无法打开摄像头 {dev_path}')
             raise RuntimeError(f'无法打开摄像头 {dev_path}')
 
-        # 强制使用 MJPG，带宽更低、帧率更高
+        # 即使已用 v4l2-ctl 预设，也再次 set 作为兜底（对支持的驱动生效）
         if self._use_mjpg:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
 
@@ -195,13 +282,21 @@ class UsbCameraNode(Node):
         # 将 V4L2 内核缓冲区减到 1，cap.read() 始终取最新帧而不是积压的旧帧
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # 读取实际设置值并打印（V4L2 可能调整为最近支持分辨率）
-        actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        # 读取并打印实际生效的参数
+        actual_w    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps  = cap.get(cv2.CAP_PROP_FPS)
+        fourcc_int  = int(cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc_str  = ''.join(chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4))
         self.get_logger().info(
-            f'实际分辨率：{actual_w}×{actual_h} @ {actual_fps:.1f}fps'
+            f'实际分辨率：{actual_w}×{actual_h} @ {actual_fps:.1f}fps  '
+            f'格式：{fourcc_str}'
         )
+        if self._use_mjpg and fourcc_str.upper() != 'MJPG':
+            self.get_logger().warn(
+                f'警告：期望 MJPG 但实际格式为 {fourcc_str}，'
+                f'帧率可能受 USB 带宽限制（YUYV @ 1280×720 ≈ 5fps）'
+            )
         self._cap = cap
 
     def _capture_loop(self) -> None:
