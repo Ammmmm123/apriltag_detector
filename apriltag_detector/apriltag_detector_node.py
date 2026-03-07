@@ -147,12 +147,16 @@ class AprilTagDetectorNode(Node):
         self._camera_params = (fx, fy, cx, cy)
 
         # ── 初始化检测器 ─────────────────────────────────────────────────
-        self._detector = Detector(
+        # 每个工作线程独立持有一个 Detector 实例，实现真正的多核并行检测。
+        # libapriltag 的 nthreads 仅对批量帧有效，单帧检测是串行的，
+        # 因此多实例并行才是利用多核的正确方式。
+        _NUM_WORKERS = 4  # 同时运行 4 个检测线程，匹配 RK3588S 的 4 个 A76 大核
+        self._detector_params = dict(
             families=self._tag_family,
-            nthreads=8,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
-            quad_decimate=3.0,   # 1.5=下采样，1280x720→640x360，计算量降低约45%
+            nthreads=1,          # 每个实例单线程，由线程池负责并行
+            quad_decimate=3.0,
             quad_sigma=0.0,
-            refine_edges=0,      # 关闭边缘精化，减少约20%计算量，近距离影响不大
+            refine_edges=0,
             decode_sharpening=0.25,
             debug=0,
         )
@@ -161,7 +165,8 @@ class AprilTagDetectorNode(Node):
         self.get_logger().info(
             f'AprilTag 检测器初始化：family={self._tag_family}  '
             f'默认 tag_size={self._tag_size} m  '
-            f'检测目标 ID：{tracked_ids}'
+            f'检测目标 ID：{tracked_ids}  '
+            f'工作线程数：{_NUM_WORKERS}'
         )
 
         # ── QoS ─────────────────────────────────────────────────────────
@@ -201,13 +206,19 @@ class AprilTagDetectorNode(Node):
                 Image, '/camera/image_debug', qos_sub
             )
 
-        # ── 检测工作线程 ─────────────────────────────────────────────────
-        # maxsize=1：队列满时新帧替换旧帧，确保始终处理最新图像，自然跳帧
-        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
-        self._worker = threading.Thread(
-            target=self._detection_worker, daemon=True, name='apriltag_worker'
-        )
-        self._worker.start()
+        # ── 检测工作线程池 ────────────────────────────────────────────────
+        # maxsize=_NUM_WORKERS：允许所有线程同时各持一帧并行处理
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=_NUM_WORKERS)
+        self._workers: list[threading.Thread] = []
+        for i in range(_NUM_WORKERS):
+            t = threading.Thread(
+                target=self._detection_worker,
+                args=(Detector(**self._detector_params),),
+                daemon=True,
+                name=f'apriltag_worker_{i}',
+            )
+            t.start()
+            self._workers.append(t)
 
         self.get_logger().info('AprilTagDetectorNode 启动完成')
 
@@ -248,7 +259,7 @@ class AprilTagDetectorNode(Node):
             self.get_logger().error(f'图像转换失败：{e}')
             return
 
-        # 非阻塞入队：若队列已满则先取出旧帧再放入新帧，始终保持最新图像
+        # 非阻塞入队：若队列已满（所有线程都在忙）则丢弃最旧帧换入新帧
         item = (gray, frame, msg.header.stamp)
         try:
             self._frame_queue.put_nowait(item)
@@ -259,15 +270,15 @@ class AprilTagDetectorNode(Node):
                 pass
             self._frame_queue.put_nowait(item)
 
-    def _detection_worker(self) -> None:
-        """工作线程：持续从队列取帧，执行检测与发布，与回调线程完全解耦。"""
+    def _detection_worker(self, detector: 'Detector') -> None:
+        """工作线程：每个线程独占一个 Detector 实例，并行处理不同帧。"""
         while rclpy.ok():
             try:
                 gray, frame, stamp = self._frame_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            detections = self._detector.detect(
+            detections = detector.detect(
                 gray,
                 estimate_tag_pose=False,
                 camera_params=self._camera_params,
