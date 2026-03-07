@@ -23,6 +23,7 @@ AprilTagDetectorNode：订阅 /camera/image_raw，
 """
 
 import os
+import time
 import yaml
 import math
 import threading
@@ -33,6 +34,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy,DurabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
@@ -145,6 +147,8 @@ class AprilTagDetectorNode(Node):
         cx = float(self._camera_matrix[0, 2])
         cy = float(self._camera_matrix[1, 2])
         self._camera_params = (fx, fy, cx, cy)
+        # 回调将 1280×720 图像 resize 到 640×360（÷2），检测后角点需乘此系数还原到原始坐标
+        self._corner_scale = 2.0
 
         # ── 初始化检测器 ─────────────────────────────────────────────────
         self._detector = Detector(
@@ -244,6 +248,8 @@ class AprilTagDetectorNode(Node):
             else:
                 gray = self._bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
                 frame = None
+            # 缩小到 1/2 分辨率（640×360）：减少传入 C 库的数据量，使图像完整放入 A76 L2 缓存
+            gray = cv2.resize(gray, (640, 360), interpolation=cv2.INTER_AREA)
         except Exception as e:
             self.get_logger().error(f'图像转换失败：{e}')
             return
@@ -261,17 +267,30 @@ class AprilTagDetectorNode(Node):
 
     def _detection_worker(self) -> None:
         """工作线程：持续从队列取帧，执行检测与发布，与回调线程完全解耦。"""
+        # 固定到 A76 大核（RK3588S：core 4-7 为 Cortex-A76 @ 2.4GHz）
+        # 防止 OS 调度到 A55 小核（core 0-3 @ 1.8GHz），避免 CV 算法性能损失
+        try:
+            os.sched_setaffinity(0, {4, 5, 6, 7})
+            self.get_logger().info('检测线程已固定到 A76 大核 (CPU 4-7)')
+        except (AttributeError, OSError) as e:
+            self.get_logger().warn(f'无法设置 CPU 亲和性：{e}')
+
         while rclpy.ok():
             try:
                 gray, frame, stamp = self._frame_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
+            _t0 = time.perf_counter()
             detections = self._detector.detect(
                 gray,
                 estimate_tag_pose=False,
                 camera_params=self._camera_params,
                 tag_size=self._tag_size,
+            )
+            self.get_logger().debug(
+                f'detect(): {(time.perf_counter()-_t0)*1000:.1f} ms  '
+                f'tags={len(detections)}'
             )
 
             if not detections:
@@ -279,11 +298,14 @@ class AprilTagDetectorNode(Node):
                     self._publish_debug_image(frame, [], stamp)
                 continue
 
-            for det in detections:
-                self._publish_detection(det, stamp)
+            # 将检测坐标从下采样空间（640×360）还原到原始分辨率（1280×720）
+            det_items = [(det, det.corners * self._corner_scale) for det in detections]
+
+            for det, corners_full in det_items:
+                self._publish_detection(det, stamp, corners_full)
 
             if self._pub_debug:
-                self._publish_debug_image(frame, detections, stamp)
+                self._publish_debug_image(frame, det_items, stamp)
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -293,14 +315,15 @@ class AprilTagDetectorNode(Node):
         """返回指定 tag_id 对应的实际边长（米）；未配置则用默认值。"""
         return self._tag_size_dict.get(tag_id, self._tag_size)
 
-    def _publish_detection(self, det, stamp) -> None:
+    def _publish_detection(self, det, stamp, corners) -> None:
         """
         对单个检测结果发布到公共话题。
         header.frame_id = "tag_<N>" 编码标签 ID，订阅者通过读取 frame_id 即可区分不同码。
+        corners: 已还原到原始分辨率（1280×720）的角点坐标，用于 PnP 解算。
         """
         tag_size = self._get_tag_size(det.tag_id)
         try:
-            rvec, tvec = self._pose_estimator.solve_pnp(det.corners, tag_size)
+            rvec, tvec = self._pose_estimator.solve_pnp(corners, tag_size)
         except RuntimeError as e:
             self.get_logger().warn(f'PnP 解算失败 ID={det.tag_id}：{e}')
             return
@@ -382,20 +405,21 @@ class AprilTagDetectorNode(Node):
     # 调试图像
     # ------------------------------------------------------------------
 
-    def _publish_debug_image(self, frame: np.ndarray, detections: list,
+    def _publish_debug_image(self, frame: np.ndarray, det_items: list,
                               stamp) -> None:
         """在图像上叠加检测信息并发布到 /camera/image_debug。所有码均显示位置/距离/坐标轴。"""
         debug = frame.copy()
-        for det in detections:
-            corners = det.corners.astype(int)
+        for det, corners_full in det_items:
+            corners = corners_full.astype(int)
             color = self._COLOR_BBOX
 
             # 绘制边框
             cv2.polylines(debug, [corners], True, color, 2)
 
-            # 中心点
-            cx_px = int(det.center[0])
-            cy_px = int(det.center[1])
+            # 中心点（从还原后角点计算，坐标已对齐到原始分辨率）
+            center = corners_full.mean(axis=0)
+            cx_px = int(center[0])
+            cy_px = int(center[1])
             cv2.circle(debug, (cx_px, cy_px), 5, self._COLOR_CENTER, -1)
 
             # 标签 ID
@@ -408,7 +432,7 @@ class AprilTagDetectorNode(Node):
             # 所有码均尝试解算 PnP 并显示位置/距离
             try:
                 _sz = self._get_tag_size(det.tag_id)
-                rvec, tvec = self._pose_estimator.solve_pnp(det.corners, _sz)
+                rvec, tvec = self._pose_estimator.solve_pnp(corners_full, _sz)
                 tx = float(tvec[0])
                 ty = float(tvec[1])
                 tz = float(tvec[2])
@@ -434,7 +458,7 @@ class AprilTagDetectorNode(Node):
         # 左上角检测统计
         cv2.putText(
             debug,
-            f'AprilTags detected: {len(detections)}',
+            f'AprilTags detected: {len(det_items)}',
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
         )
@@ -501,8 +525,10 @@ class AprilTagDetectorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = AprilTagDetectorNode()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
