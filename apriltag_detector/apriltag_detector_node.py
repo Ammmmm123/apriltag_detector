@@ -31,7 +31,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy,DurabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import (
@@ -169,9 +169,10 @@ class AprilTagDetectorNode(Node):
             depth=1,
         )
         qos_pub = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
+            depth=2,
         )
 
         # ── 订阅 ─────────────────────────────────────────────────────────
