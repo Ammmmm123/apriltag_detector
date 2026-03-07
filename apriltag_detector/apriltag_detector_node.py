@@ -93,6 +93,9 @@ class AprilTagDetectorNode(Node):
         self.declare_parameter('max_hamming', 0)
         self.declare_parameter('publish_debug_image', False)
         self.declare_parameter('frame_id', 'camera_optical_frame')
+        # 摄像头实际分辨率，用于判断是否需要 resize 及计算 corner_scale
+        self.declare_parameter('image_width',  640)
+        self.declare_parameter('image_height', 360)
 
         default_cfg = os.path.join(
             get_package_share_directory('apriltag_detector'),
@@ -107,6 +110,8 @@ class AprilTagDetectorNode(Node):
         self._pub_debug       = self.get_parameter('publish_debug_image').value
         self._frame_id        = self.get_parameter('frame_id').value
         self._cfg_path        = self.get_parameter('camera_params_file').value
+        self._img_w           = self.get_parameter('image_width').value
+        self._img_h           = self.get_parameter('image_height').value
 
         # 解析 tag_size_map："id:size,id:size" → {int: float}
         self._tag_size_dict: dict[int, float] = {}
@@ -147,9 +152,9 @@ class AprilTagDetectorNode(Node):
         cx = float(self._camera_matrix[0, 2])
         cy = float(self._camera_matrix[1, 2])
         self._camera_params = (fx, fy, cx, cy)
-        # 若摄像头分辨率已是 640×360，则无需 resize，corner_scale=1.0
-        # 若是 1280×720，则在回调中 resize，corner_scale=2.0（还原角点到原始坐标）
-        _DETECT_W, _DETECT_H = 640, 360
+        # 若摄像头分辨率已是 640×480 或更小，则无需 resize，corner_scale=1.0
+        # 若是 1280×720 等更高分辨率，则在回调中 resize 后再检测
+        _DETECT_W, _DETECT_H = 640, 480
         if self._img_w <= _DETECT_W and self._img_h <= _DETECT_H:
             self._corner_scale = 1.0
             self._resize_input = False
