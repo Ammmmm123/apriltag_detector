@@ -87,7 +87,7 @@ class AprilTagDetectorNode(Node):
         self.declare_parameter('tag_size', 0.133)
         self.declare_parameter('tag_size_map', '254:0.175,80:0.022')   # 例如 "4:0.133,7:0.080"
         self.declare_parameter('max_hamming', 0)
-        self.declare_parameter('publish_debug_image', True)
+        self.declare_parameter('publish_debug_image', False)
         self.declare_parameter('frame_id', 'camera_optical_frame')
 
         default_cfg = os.path.join(
@@ -172,7 +172,7 @@ class AprilTagDetectorNode(Node):
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=2,
+            depth=1,
         )
 
         # ── 订阅 ─────────────────────────────────────────────────────────

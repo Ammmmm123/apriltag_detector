@@ -25,7 +25,7 @@ def generate_launch_description():
         DeclareLaunchArgument('tag_size',      default_value='0.175'),   # 未在 tag_size_map 中的 ID 回退值
         # ID 254: 大码 0.175 m；ID 80: 小码 0.022 m
         DeclareLaunchArgument('tag_size_map',  default_value='254:0.175,80:0.022'),
-        DeclareLaunchArgument('publish_debug_image', default_value='true'),
+        DeclareLaunchArgument('publish_debug_image', default_value='false'),
         DeclareLaunchArgument('camera_params_file',  default_value=default_camera_params),
 
         # ── 摄像头采集节点 ────────────────────────────────────────────
