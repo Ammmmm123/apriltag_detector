@@ -14,7 +14,7 @@ def generate_launch_description():
         # ── 可调参数 ──────────────────────────────────────────────────
         DeclareLaunchArgument('width',       default_value='640'),
         DeclareLaunchArgument('height',      default_value='480'),
-        DeclareLaunchArgument('fps',          default_value='30'),
+        DeclareLaunchArgument('fps',          default_value='15'),
         # focus_absolute 范围：0~1023（值越大=越近，值越小=越远/无穷远）
         # 超焦距约 2.3m，对准 2~3m 处由 AF 读取的实测值
         # TODO: 将 -1 替换为实测超焦距值（对准 2~3m 处，AF 收敛后读取）

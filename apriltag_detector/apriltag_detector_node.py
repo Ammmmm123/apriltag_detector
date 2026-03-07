@@ -23,7 +23,6 @@ AprilTagDetectorNode：订阅 /camera/image_raw，
 """
 
 import os
-import time
 import yaml
 import math
 import threading
@@ -34,7 +33,6 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy,DurabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
@@ -93,9 +91,6 @@ class AprilTagDetectorNode(Node):
         self.declare_parameter('max_hamming', 0)
         self.declare_parameter('publish_debug_image', False)
         self.declare_parameter('frame_id', 'camera_optical_frame')
-        # 摄像头实际分辨率，用于判断是否需要 resize 及计算 corner_scale
-        self.declare_parameter('image_width',  640)
-        self.declare_parameter('image_height', 360)
 
         default_cfg = os.path.join(
             get_package_share_directory('apriltag_detector'),
@@ -110,8 +105,6 @@ class AprilTagDetectorNode(Node):
         self._pub_debug       = self.get_parameter('publish_debug_image').value
         self._frame_id        = self.get_parameter('frame_id').value
         self._cfg_path        = self.get_parameter('camera_params_file').value
-        self._img_w           = self.get_parameter('image_width').value
-        self._img_h           = self.get_parameter('image_height').value
 
         # 解析 tag_size_map："id:size,id:size" → {int: float}
         self._tag_size_dict: dict[int, float] = {}
@@ -152,39 +145,12 @@ class AprilTagDetectorNode(Node):
         cx = float(self._camera_matrix[0, 2])
         cy = float(self._camera_matrix[1, 2])
         self._camera_params = (fx, fy, cx, cy)
-        # 若摄像头分辨率已是 640×480 或更小，则无需 resize，corner_scale=1.0
-        # 若是 1280×720 等更高分辨率，则在回调中 resize 后再检测
-        _DETECT_W, _DETECT_H = 640, 480
-        if self._img_w <= _DETECT_W and self._img_h <= _DETECT_H:
-            self._corner_scale = 1.0
-            self._resize_input = False
-        else:
-            self._corner_scale = self._img_w / _DETECT_W
-            self._resize_input = True
-        self._detect_size = (_DETECT_W, _DETECT_H)
-
-        # 尝试启用 OpenCL（Mali-G610 支持 OpenCL 2.0）
-        # 若 OpenCV 未编译 OpenCL 支持则自动退化到 CPU
-        self._ocl_available = cv2.ocl.haveOpenCL()
-        if self._ocl_available:
-            cv2.ocl.setUseOpenCL(True)
-            self.get_logger().info(
-                f'OpenCL 可用 ({cv2.ocl.Device.getDefault().name()})，'
-                f'预处理将尝试卸载到 Mali GPU'
-            )
-        else:
-            self.get_logger().info('OpenCL 不可用，预处理在 CPU 执行')
-
-        self.get_logger().info(
-            f'输入分辨率={self._img_w}×{self._img_h}  '
-            f'resize={self._resize_input}  corner_scale={self._corner_scale:.2f}'
-        )
 
         # ── 初始化检测器 ─────────────────────────────────────────────────
         self._detector = Detector(
             families=self._tag_family,
-            nthreads=4,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
-            quad_decimate=1.0,   # 输入已是 640×360，无需再抽取，设为1.0保留全部细节
+            nthreads=6,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
+            quad_decimate=1.0,   # 1.0=下采样，1280x720→640x360，计算量降低约45%
             quad_sigma=0.0,
             refine_edges=0,      # 关闭边缘精化，减少约20%计算量，近距离影响不大
             decode_sharpening=0.25,
@@ -278,15 +244,6 @@ class AprilTagDetectorNode(Node):
             else:
                 gray = self._bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
                 frame = None
-            # 仅当摄像头分辨率高于检测分辨率时才 resize
-            if self._resize_input:
-                if self._ocl_available:
-                    # 用 UMat 将 resize 卸载到 Mali GPU
-                    gray = cv2.resize(
-                        cv2.UMat(gray), self._detect_size, interpolation=cv2.INTER_AREA
-                    ).get()
-                else:
-                    gray = cv2.resize(gray, self._detect_size, interpolation=cv2.INTER_AREA)
         except Exception as e:
             self.get_logger().error(f'图像转换失败：{e}')
             return
@@ -304,30 +261,17 @@ class AprilTagDetectorNode(Node):
 
     def _detection_worker(self) -> None:
         """工作线程：持续从队列取帧，执行检测与发布，与回调线程完全解耦。"""
-        # 固定到 A76 大核（RK3588S：core 4-7 为 Cortex-A76 @ 2.4GHz）
-        # 防止 OS 调度到 A55 小核（core 0-3 @ 1.8GHz），避免 CV 算法性能损失
-        try:
-            os.sched_setaffinity(0, {4, 5, 6, 7})
-            self.get_logger().info('检测线程已固定到 A76 大核 (CPU 4-7)')
-        except (AttributeError, OSError) as e:
-            self.get_logger().warn(f'无法设置 CPU 亲和性：{e}')
-
         while rclpy.ok():
             try:
                 gray, frame, stamp = self._frame_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            _t0 = time.perf_counter()
             detections = self._detector.detect(
                 gray,
                 estimate_tag_pose=False,
                 camera_params=self._camera_params,
                 tag_size=self._tag_size,
-            )
-            self.get_logger().debug(
-                f'detect(): {(time.perf_counter()-_t0)*1000:.1f} ms  '
-                f'tags={len(detections)}'
             )
 
             if not detections:
@@ -335,14 +279,11 @@ class AprilTagDetectorNode(Node):
                     self._publish_debug_image(frame, [], stamp)
                 continue
 
-            # 将检测坐标从下采样空间（640×360）还原到原始分辨率（1280×720）
-            det_items = [(det, det.corners * self._corner_scale) for det in detections]
-
-            for det, corners_full in det_items:
-                self._publish_detection(det, stamp, corners_full)
+            for det in detections:
+                self._publish_detection(det, stamp)
 
             if self._pub_debug:
-                self._publish_debug_image(frame, det_items, stamp)
+                self._publish_debug_image(frame, detections, stamp)
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -352,15 +293,14 @@ class AprilTagDetectorNode(Node):
         """返回指定 tag_id 对应的实际边长（米）；未配置则用默认值。"""
         return self._tag_size_dict.get(tag_id, self._tag_size)
 
-    def _publish_detection(self, det, stamp, corners) -> None:
+    def _publish_detection(self, det, stamp) -> None:
         """
         对单个检测结果发布到公共话题。
         header.frame_id = "tag_<N>" 编码标签 ID，订阅者通过读取 frame_id 即可区分不同码。
-        corners: 已还原到原始分辨率（1280×720）的角点坐标，用于 PnP 解算。
         """
         tag_size = self._get_tag_size(det.tag_id)
         try:
-            rvec, tvec = self._pose_estimator.solve_pnp(corners, tag_size)
+            rvec, tvec = self._pose_estimator.solve_pnp(det.corners, tag_size)
         except RuntimeError as e:
             self.get_logger().warn(f'PnP 解算失败 ID={det.tag_id}：{e}')
             return
@@ -442,21 +382,20 @@ class AprilTagDetectorNode(Node):
     # 调试图像
     # ------------------------------------------------------------------
 
-    def _publish_debug_image(self, frame: np.ndarray, det_items: list,
+    def _publish_debug_image(self, frame: np.ndarray, detections: list,
                               stamp) -> None:
         """在图像上叠加检测信息并发布到 /camera/image_debug。所有码均显示位置/距离/坐标轴。"""
         debug = frame.copy()
-        for det, corners_full in det_items:
-            corners = corners_full.astype(int)
+        for det in detections:
+            corners = det.corners.astype(int)
             color = self._COLOR_BBOX
 
             # 绘制边框
             cv2.polylines(debug, [corners], True, color, 2)
 
-            # 中心点（从还原后角点计算，坐标已对齐到原始分辨率）
-            center = corners_full.mean(axis=0)
-            cx_px = int(center[0])
-            cy_px = int(center[1])
+            # 中心点
+            cx_px = int(det.center[0])
+            cy_px = int(det.center[1])
             cv2.circle(debug, (cx_px, cy_px), 5, self._COLOR_CENTER, -1)
 
             # 标签 ID
@@ -469,7 +408,7 @@ class AprilTagDetectorNode(Node):
             # 所有码均尝试解算 PnP 并显示位置/距离
             try:
                 _sz = self._get_tag_size(det.tag_id)
-                rvec, tvec = self._pose_estimator.solve_pnp(corners_full, _sz)
+                rvec, tvec = self._pose_estimator.solve_pnp(det.corners, _sz)
                 tx = float(tvec[0])
                 ty = float(tvec[1])
                 tz = float(tvec[2])
@@ -495,7 +434,7 @@ class AprilTagDetectorNode(Node):
         # 左上角检测统计
         cv2.putText(
             debug,
-            f'AprilTags detected: {len(det_items)}',
+            f'AprilTags detected: {len(detections)}',
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
         )
@@ -562,10 +501,8 @@ class AprilTagDetectorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = AprilTagDetectorNode()
-    executor = MultiThreadedExecutor(num_threads=2)
-    executor.add_node(node)
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
