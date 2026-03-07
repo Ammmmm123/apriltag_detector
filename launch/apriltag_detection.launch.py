@@ -12,8 +12,8 @@ def generate_launch_description():
 
     return LaunchDescription([
         # ── 可调参数 ──────────────────────────────────────────────────
-        DeclareLaunchArgument('width',       default_value='800'),
-        DeclareLaunchArgument('height',      default_value='600'),
+        DeclareLaunchArgument('width',       default_value='1280'),
+        DeclareLaunchArgument('height',      default_value='720'),
         DeclareLaunchArgument('fps',          default_value='30'),
         # focus_absolute 范围：0~1023（值越大=越近，值越小=越远/无穷远）
         # 超焦距约 2.3m，对准 2~3m 处由 AF 读取的实测值
