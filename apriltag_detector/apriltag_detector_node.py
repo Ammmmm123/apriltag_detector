@@ -149,8 +149,8 @@ class AprilTagDetectorNode(Node):
         # ── 初始化检测器 ─────────────────────────────────────────────────
         self._detector = Detector(
             families=self._tag_family,
-            nthreads=6,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
-            quad_decimate=1.5,   # 1.5=下采样，1280x720→640x360，计算量降低约45%
+            nthreads=8,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
+            quad_decimate=3.0,   # 1.5=下采样，1280x720→640x360，计算量降低约45%
             quad_sigma=0.0,
             refine_edges=0,      # 关闭边缘精化，减少约20%计算量，近距离影响不大
             decode_sharpening=0.25,
