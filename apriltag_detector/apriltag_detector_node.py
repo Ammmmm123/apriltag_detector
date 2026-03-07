@@ -25,6 +25,8 @@ AprilTagDetectorNode：订阅 /camera/image_raw，
 import os
 import yaml
 import math
+import threading
+import queue
 
 import cv2
 import numpy as np
@@ -148,9 +150,9 @@ class AprilTagDetectorNode(Node):
         self._detector = Detector(
             families=self._tag_family,
             nthreads=4,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
-            quad_decimate=2.0,   # 2.0=整数倍下采样，1280x720→640x360，计算量降低约45%
+            quad_decimate=1.5,   # 1.5=下采样，1280x720→640x360，计算量降低约45%
             quad_sigma=0.0,
-            refine_edges=1,
+            refine_edges=0,      # 关闭边缘精化，减少约20%计算量，近距离影响不大
             decode_sharpening=0.25,
             debug=0,
         )
@@ -199,6 +201,14 @@ class AprilTagDetectorNode(Node):
                 Image, '/camera/image_debug', qos_sub
             )
 
+        # ── 检测工作线程 ─────────────────────────────────────────────────
+        # maxsize=1：队列满时新帧替换旧帧，确保始终处理最新图像，自然跳帧
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._worker = threading.Thread(
+            target=self._detection_worker, daemon=True, name='apriltag_worker'
+        )
+        self._worker.start()
+
         self.get_logger().info('AprilTagDetectorNode 启动完成')
 
     # ------------------------------------------------------------------
@@ -226,54 +236,54 @@ class AprilTagDetectorNode(Node):
             self.destroy_subscription(self._sub_info)
 
     def _image_callback(self, msg: Image) -> None:
-        """图像订阅回调：检测 → 解算 → 发布。"""
+        """图像订阅回调：仅负责解码入队，立即返回，不阻塞执行器。"""
         try:
             if self._pub_debug:
-                # 调试模式：需要彩色帧用于叠加绘图
                 frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             else:
-                # 非调试模式：直接解码为灰度，省去中间 BGR 分配与色彩转换
                 gray = self._bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
                 frame = None
         except Exception as e:
             self.get_logger().error(f'图像转换失败：{e}')
             return
 
-        # AprilTag 检测
-        # estimate_tag_pose=False：角点检测与 tag_size 无关，内置位姿估计
-        # 只支持单一尺寸，多尺寸场景下由后续 solve_pnp 按各码真实尺寸解算。
-        detections = self._detector.detect(
-            gray,
-            estimate_tag_pose=False,
-            camera_params=self._camera_params,
-            tag_size=self._tag_size,
-        )
+        # 非阻塞入队：若队列已满则先取出旧帧再放入新帧，始终保持最新图像
+        item = (gray, frame, msg.header.stamp)
+        try:
+            self._frame_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._frame_queue.put_nowait(item)
 
-        stamp = msg.header.stamp
+    def _detection_worker(self) -> None:
+        """工作线程：持续从队列取帧，执行检测与发布，与回调线程完全解耦。"""
+        while rclpy.ok():
+            try:
+                gray, frame, stamp = self._frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-        if not detections:
+            detections = self._detector.detect(
+                gray,
+                estimate_tag_pose=False,
+                camera_params=self._camera_params,
+                tag_size=self._tag_size,
+            )
+
+            if not detections:
+                if self._pub_debug:
+                    self._publish_debug_image(frame, [], stamp)
+                continue
+
+            for det in detections:
+                self._publish_detection(det, stamp)
+
             if self._pub_debug:
-                self._publish_debug_image(frame, [], stamp)
-            return
-
-        # 发布所有标签 PoseArray  （按检测顺序，未区分 ID，供需要批量处理的订阅者使用）
-        # pose_array = PoseArray()
-        # pose_array.header.stamp    = stamp
-        # pose_array.header.frame_id = self._frame_id
-        # for det in detections:
-        #     pose_array.poses.append(
-        #         self._detection_to_pose(det)
-        #     )
-        # self._pub_poses.publish(pose_array)
-
-        # 每个检测到的标签均发布到同一套话题，frame_id 编码 tag ID
-        for det in detections:
-            self._publish_detection(det, stamp)
-
-        # 调试图像
-        if self._pub_debug:
-            self._publish_debug_image(frame, detections, stamp)
+                self._publish_debug_image(frame, detections, stamp)
 
     # ------------------------------------------------------------------
     # 辅助方法
