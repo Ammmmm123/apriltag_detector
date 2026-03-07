@@ -87,12 +87,24 @@ class PoseEstimator:
     def rvec_to_euler(
         self, rvec: np.ndarray
     ) -> tuple[float, float, float]:
+        """旋转向量 → 欧拉角 (roll, pitch, yaw)，单位：弧度。"""
+        return self.R_to_euler(self.rvec_to_rotation_matrix(rvec))
+
+    def rvec_to_quaternion(
+        self, rvec: np.ndarray
+    ) -> tuple[float, float, float, float]:
+        """旋转向量 → 四元数 (x, y, z, w)，符合 ROS2 geometry_msgs 标准。"""
+        return self.R_to_quaternion(self.rvec_to_rotation_matrix(rvec))
+
+    def R_to_euler(
+        self, R: np.ndarray
+    ) -> tuple[float, float, float]:
         """
-        旋转向量 → 欧拉角 (roll, pitch, yaw)，单位：弧度。
+        旋转矩阵 → 欧拉角 (roll, pitch, yaw)，单位：弧度。
 
         采用 ZYX（yaw-pitch-roll）内旋顺序，与航空/机器人惯例一致。
+        当已有旋转矩阵时直接调用此方法，避免重复执行 Rodrigues 运算。
         """
-        R = self.rvec_to_rotation_matrix(rvec)
         # ZYX 内旋：R = Rz(yaw) * Ry(pitch) * Rx(roll)
         sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
         singular = sy < 1e-6
@@ -106,13 +118,14 @@ class PoseEstimator:
             yaw   = 0.0
         return roll, pitch, yaw
 
-    def rvec_to_quaternion(
-        self, rvec: np.ndarray
+    def R_to_quaternion(
+        self, R: np.ndarray
     ) -> tuple[float, float, float, float]:
         """
-        旋转向量 → 四元数 (x, y, z, w)，符合 ROS2 geometry_msgs 标准。
+        旋转矩阵 → 四元数 (x, y, z, w)，符合 ROS2 geometry_msgs 标准。
+
+        当已有旋转矩阵时直接调用此方法，避免重复执行 Rodrigues 运算。
         """
-        R = self.rvec_to_rotation_matrix(rvec)
         trace = R[0, 0] + R[1, 1] + R[2, 2]
         if trace > 0:
             s = 0.5 / math.sqrt(trace + 1.0)

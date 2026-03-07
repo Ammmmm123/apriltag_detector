@@ -147,8 +147,8 @@ class AprilTagDetectorNode(Node):
         # ── 初始化检测器 ─────────────────────────────────────────────────
         self._detector = Detector(
             families=self._tag_family,
-            nthreads=2,
-            quad_decimate=1.5,   # 下采样加速，适当降低精度换取速度
+            nthreads=4,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
+            quad_decimate=2.0,   # 2.0=整数倍下采样，1280x720→640x360，计算量降低约45%
             quad_sigma=0.0,
             refine_edges=1,
             decode_sharpening=0.25,
@@ -168,9 +168,11 @@ class AprilTagDetectorNode(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        # 注意：TRANSIENT_LOCAL 仅与 RELIABLE 兼容，混用 BEST_EFFORT 是未定义行为，
+        # 会导致 FastDDS 中间件阻塞/重传，造成长达数百秒的消息延迟，此处改为 VOLATILE。
         qos_pub = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1,
         )
@@ -226,12 +228,17 @@ class AprilTagDetectorNode(Node):
     def _image_callback(self, msg: Image) -> None:
         """图像订阅回调：检测 → 解算 → 发布。"""
         try:
-            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if self._pub_debug:
+                # 调试模式：需要彩色帧用于叠加绘图
+                frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else:
+                # 非调试模式：直接解码为灰度，省去中间 BGR 分配与色彩转换
+                gray = self._bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+                frame = None
         except Exception as e:
             self.get_logger().error(f'图像转换失败：{e}')
             return
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # AprilTag 检测
         # estimate_tag_pose=False：角点检测与 tag_size 无关，内置位姿估计
@@ -288,8 +295,10 @@ class AprilTagDetectorNode(Node):
             self.get_logger().warn(f'PnP 解算失败 ID={det.tag_id}：{e}')
             return
 
-        qx, qy, qz, qw = self._pose_estimator.rvec_to_quaternion(rvec)
-        roll, pitch, yaw = self._pose_estimator.rvec_to_euler(rvec)
+        # 只计算一次旋转矩阵，同时用于四元数与欧拉角，避免两次 Rodrigues 调用
+        R = self._pose_estimator.rvec_to_rotation_matrix(rvec)
+        qx, qy, qz, qw = self._pose_estimator.R_to_quaternion(R)
+        roll, pitch, yaw = self._pose_estimator.R_to_euler(R)
         tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
         distance = PoseEstimator.translation_to_distance(tvec)
 
