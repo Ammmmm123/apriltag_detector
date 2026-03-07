@@ -11,6 +11,7 @@ UsbCameraNode：通过 OpenCV 采集 USB UVC 摄像头图像，
 
 import os
 import subprocess
+import threading
 import yaml
 
 import cv2
@@ -92,9 +93,11 @@ class UsbCameraNode(Node):
         self._cap = None
         self._configure_camera()
 
-        # ── 定时器 ────────────────────────────────────────────────────
-        timer_period = 1.0 / max(self._fps, 1)
-        self._timer = self.create_timer(timer_period, self._timer_callback)
+        # ── 采集线程（替代定时器，cap.read() 阻塞不影响 ROS 执行器）──────
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name='camera_capture'
+        )
+        self._capture_thread.start()
         self.get_logger().info(
             f'UsbCameraNode 启动：/dev/video{self._device_id} '
             f'{self._width}×{self._height} @ {self._fps}fps'
@@ -189,6 +192,8 @@ class UsbCameraNode(Node):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
         cap.set(cv2.CAP_PROP_FPS,          self._fps)
+        # 将 V4L2 内核缓冲区减到 1，cap.read() 始终取最新帧而不是积压的旧帧
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         # 读取实际设置值并打印（V4L2 可能调整为最近支持分辨率）
         actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -199,29 +204,29 @@ class UsbCameraNode(Node):
         )
         self._cap = cap
 
-    def _timer_callback(self) -> None:
-        """定时器回调：读取一帧并发布。"""
-        if self._cap is None or not self._cap.isOpened():
-            self.get_logger().warn('摄像头未就绪，跳过本次采集')
-            return
+    def _capture_loop(self) -> None:
+        """采集线程主循环：以最快速度持续调用 cap.read()，直接发布，不经过定时器。"""
+        while rclpy.ok():
+            if self._cap is None or not self._cap.isOpened():
+                self.get_logger().warn('摄像头未就绪，等待重试...')
+                import time; time.sleep(0.5)
+                continue
 
-        ret, frame = self._cap.read()
-        if not ret or frame is None:
-            self.get_logger().warn('读取帧失败')
-            return
+            ret, frame = self._cap.read()   # 阻塞直到摄像头交付一帧
+            if not ret or frame is None:
+                self.get_logger().warn('读取帧失败')
+                continue
 
-        stamp = self.get_clock().now().to_msg()
+            stamp = self.get_clock().now().to_msg()
 
-        # 发布原始图像
-        img_msg = self._bridge.cv2_to_imgmsg(frame, encoding='bgr8')
-        img_msg.header.stamp    = stamp
-        img_msg.header.frame_id = self._frame_id
-        self._pub_image.publish(img_msg)
+            img_msg = self._bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+            img_msg.header.stamp    = stamp
+            img_msg.header.frame_id = self._frame_id
+            self._pub_image.publish(img_msg)
 
-        # 发布相机信息
-        self._camera_info_msg.header.stamp    = stamp
-        self._camera_info_msg.header.frame_id = self._frame_id
-        self._pub_info.publish(self._camera_info_msg)
+            self._camera_info_msg.header.stamp    = stamp
+            self._camera_info_msg.header.frame_id = self._frame_id
+            self._pub_info.publish(self._camera_info_msg)
 
     def _build_camera_info(self, cfg_path: str) -> CameraInfo:
         """从 YAML 文件构建 CameraInfo 消息。"""
