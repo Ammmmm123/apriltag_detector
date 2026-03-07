@@ -147,14 +147,39 @@ class AprilTagDetectorNode(Node):
         cx = float(self._camera_matrix[0, 2])
         cy = float(self._camera_matrix[1, 2])
         self._camera_params = (fx, fy, cx, cy)
-        # 回调将 1280×720 图像 resize 到 640×360（÷2），检测后角点需乘此系数还原到原始坐标
-        self._corner_scale = 2.0
+        # 若摄像头分辨率已是 640×360，则无需 resize，corner_scale=1.0
+        # 若是 1280×720，则在回调中 resize，corner_scale=2.0（还原角点到原始坐标）
+        _DETECT_W, _DETECT_H = 640, 360
+        if self._img_w <= _DETECT_W and self._img_h <= _DETECT_H:
+            self._corner_scale = 1.0
+            self._resize_input = False
+        else:
+            self._corner_scale = self._img_w / _DETECT_W
+            self._resize_input = True
+        self._detect_size = (_DETECT_W, _DETECT_H)
+
+        # 尝试启用 OpenCL（Mali-G610 支持 OpenCL 2.0）
+        # 若 OpenCV 未编译 OpenCL 支持则自动退化到 CPU
+        self._ocl_available = cv2.ocl.haveOpenCL()
+        if self._ocl_available:
+            cv2.ocl.setUseOpenCL(True)
+            self.get_logger().info(
+                f'OpenCL 可用 ({cv2.ocl.Device.getDefault().name()})，'
+                f'预处理将尝试卸载到 Mali GPU'
+            )
+        else:
+            self.get_logger().info('OpenCL 不可用，预处理在 CPU 执行')
+
+        self.get_logger().info(
+            f'输入分辨率={self._img_w}×{self._img_h}  '
+            f'resize={self._resize_input}  corner_scale={self._corner_scale:.2f}'
+        )
 
         # ── 初始化检测器 ─────────────────────────────────────────────────
         self._detector = Detector(
             families=self._tag_family,
             nthreads=4,          # OrangePi 5 Pro (RK3588S) 8核，至少用4
-            quad_decimate=1.5,   # 1.5=下采样，1280x720→640x360，计算量降低约45%
+            quad_decimate=1.0,   # 输入已是 640×360，无需再抽取，设为1.0保留全部细节
             quad_sigma=0.0,
             refine_edges=0,      # 关闭边缘精化，减少约20%计算量，近距离影响不大
             decode_sharpening=0.25,
@@ -248,8 +273,15 @@ class AprilTagDetectorNode(Node):
             else:
                 gray = self._bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
                 frame = None
-            # 缩小到 1/2 分辨率（640×360）：减少传入 C 库的数据量，使图像完整放入 A76 L2 缓存
-            gray = cv2.resize(gray, (640, 360), interpolation=cv2.INTER_AREA)
+            # 仅当摄像头分辨率高于检测分辨率时才 resize
+            if self._resize_input:
+                if self._ocl_available:
+                    # 用 UMat 将 resize 卸载到 Mali GPU
+                    gray = cv2.resize(
+                        cv2.UMat(gray), self._detect_size, interpolation=cv2.INTER_AREA
+                    ).get()
+                else:
+                    gray = cv2.resize(gray, self._detect_size, interpolation=cv2.INTER_AREA)
         except Exception as e:
             self.get_logger().error(f'图像转换失败：{e}')
             return
