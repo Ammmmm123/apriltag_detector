@@ -33,10 +33,9 @@ class UsbCameraNode(Node):
     ROS2 参数
     ---------
     device_id          : int   摄像头设备号（默认 0 → /dev/video0）
-    width              : int   图像宽度像素（默认 1280）
-    height             : int   图像高度像素（默认 720）
-    fps                : int   目标帧率（默认 30）
-    use_mjpg           : bool  是否强制使用 MJPG 格式（默认 True）
+    width              : int   图像宽度像素（默认 800）
+    height             : int   图像高度像素（默认 600）
+    use_mjpg_or_yuyv   : bool  使用 MJPG 或 YUYV 格式（默认 True:YUYV）
     camera_params_file : str   相机内参 YAML 路径
     frame_id           : str   发布帧 ID（默认 "camera_optical_frame"）
     """
@@ -46,10 +45,9 @@ class UsbCameraNode(Node):
 
         # ── 声明参数 ───────────────────────────────────────────────────
         self.declare_parameter('device_id', 1)
-        self.declare_parameter('width', 1280)
-        self.declare_parameter('height', 720)
-        self.declare_parameter('fps', 30)
-        self.declare_parameter('use_mjpg', True)
+        self.declare_parameter('width', 800)
+        self.declare_parameter('height', 600)
+        self.declare_parameter('use_mjpg_or_yuyv', True)
         self.declare_parameter('frame_id', 'camera_optical_frame')
         # 对焦锁定参数：-1 表示不干预（保持自动对焦）
         self.declare_parameter('focus_absolute', 580)
@@ -65,8 +63,7 @@ class UsbCameraNode(Node):
         self._device_id  = self.get_parameter('device_id').value
         self._width      = self.get_parameter('width').value
         self._height     = self.get_parameter('height').value
-        self._fps        = self.get_parameter('fps').value
-        self._use_mjpg      = self.get_parameter('use_mjpg').value
+        self._use_mjpg_or_yuyv = self.get_parameter('use_mjpg_or_yuyv').value
         self._frame_id      = self.get_parameter('frame_id').value
         self._cfg_path      = self.get_parameter('camera_params_file').value
         self._focus_abs     = self.get_parameter('focus_absolute').value
@@ -93,11 +90,11 @@ class UsbCameraNode(Node):
         self._configure_camera()
 
         # ── 定时器 ────────────────────────────────────────────────────
-        timer_period = 1.0 / max(self._fps, 1)
+        timer_period = 1.0 / 30  # 30 Hz
         self._timer = self.create_timer(timer_period, self._timer_callback)
         self.get_logger().info(
             f'UsbCameraNode 启动：/dev/video{self._device_id} '
-            f'{self._width}×{self._height} @ {self._fps}fps'
+            f'{self._width}×{self._height} @ {30}fps'
         )
 
     # ------------------------------------------------------------------
@@ -182,13 +179,12 @@ class UsbCameraNode(Node):
             )
             raise RuntimeError(f'无法打开摄像头 {dev_path}')
 
-        # 强制使用 MJPG，带宽更低、帧率更高
-        if self._use_mjpg:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # 强制使用 YUYV，不需要解码 MJPG，减少 CPU 负担（如果摄像头支持）
+        if self._use_mjpg_or_yuyv:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        cap.set(cv2.CAP_PROP_FPS,          self._fps)
 
         # 读取实际设置值并打印（V4L2 可能调整为最近支持分辨率）
         actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))

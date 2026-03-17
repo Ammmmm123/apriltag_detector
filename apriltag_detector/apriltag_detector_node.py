@@ -42,7 +42,7 @@ from std_msgs.msg import Float64
 from cv_bridge import CvBridge
 from ament_index_python.packages import get_package_share_directory
 
-from .pose_estimator import PoseEstimator
+from apriltag_detector.pose_estimator import PoseEstimator
 
 try:
     from pupil_apriltags import Detector
@@ -87,7 +87,7 @@ class AprilTagDetectorNode(Node):
         self.declare_parameter('tag_size', 0.133)
         self.declare_parameter('tag_size_map', '254:0.175,80:0.022')   # 例如 "4:0.133,7:0.080"
         self.declare_parameter('max_hamming', 0)
-        self.declare_parameter('publish_debug_image', True)
+        self.declare_parameter('publish_debug_image', False)
         self.declare_parameter('frame_id', 'camera_optical_frame')
 
         default_cfg = os.path.join(
@@ -178,10 +178,10 @@ class AprilTagDetectorNode(Node):
         # ── 订阅 ─────────────────────────────────────────────────────────
         self._bridge = CvBridge()
         self._sub_image = self.create_subscription(
-            Image, '/camera/image_raw', self._image_callback, qos_sub
+            Image, '/world/apritag_car_x500/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/image', self._image_callback, qos_sub
         )
         self._sub_info = self.create_subscription(
-            CameraInfo, '/camera/camera_info', self._info_callback, qos_sub
+            CameraInfo, '/world/apritag_car_x500/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/camera_info', self._info_callback, qos_sub
         )
 
         # ── 发布器 ───────────────────────────────────────────────────────
@@ -205,7 +205,7 @@ class AprilTagDetectorNode(Node):
 
     def _info_callback(self, msg: CameraInfo) -> None:
         """
-        订阅 /camera/camera_info，动态更新内参（优先于文件）。
+        订阅 /world/default/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/camera_info，动态更新内参（优先于文件）。
         收到第一帧有效内参后即销毁该订阅。
         """
         if len(msg.k) == 9 and any(v != 0.0 for v in msg.k):
@@ -216,7 +216,7 @@ class AprilTagDetectorNode(Node):
             self._pose_estimator = PoseEstimator(K, D)
             self._camera_params  = (K[0, 0], K[1, 1], K[0, 2], K[1, 2])
             self.get_logger().info(
-                f'已从 /camera/camera_info 更新内参：'
+                f'已从 /world/default/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/camera_info 更新内参：'
                 f'fx={K[0,0]:.1f}  fy={K[1,1]:.1f}  '
                 f'cx={K[0,2]:.1f}  cy={K[1,2]:.1f}'
             )
