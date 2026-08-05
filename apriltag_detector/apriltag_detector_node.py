@@ -87,9 +87,9 @@ class AprilTagDetectorNode(Node):
         # ── 声明参数 ────────────────────────────────────────────────────
         self.declare_parameter('tag_family', 'tag36h11')
         self.declare_parameter('tag_size', 0.133)
-        self.declare_parameter('tag_size_map', '254:0.175,80:0.022')   # 例如 "4:0.133,7:0.080"
+        self.declare_parameter('tag_size_map', '254:0.35,80:0.05')   # 例如 "4:0.133,7:0.00"
         self.declare_parameter('max_hamming', 0)
-        self.declare_parameter('publish_debug_image', False)
+        self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('frame_id', 'camera_optical_frame')
 
         default_cfg = os.path.join(
@@ -187,11 +187,13 @@ class AprilTagDetectorNode(Node):
         # ── 订阅 ─────────────────────────────────────────────────────────
         self._bridge = CvBridge()
         self._sub_image = self.create_subscription(
-            Image, '/camera/image_raw', self._image_callback, qos_sub
+            Image, '/world/apritag_car_x500/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/image', self._image_callback, qos_sub
         )
         self._sub_info = self.create_subscription(
-            CameraInfo, '/camera/camera_info', self._info_callback, qos_sub
+            CameraInfo, '/world/apritag_car_x500/model/x500_mono_cam_down_0/link/camera_link/sensor/camera/camera_info', self._info_callback, qos_sub
         )
+#/camera/image_raw
+#/camera/camera_info
 
         # ── 发布器 ───────────────────────────────────────────────────────
         # self._pub_poses    = self.create_publisher(PoseArray,      '/apriltag/detections',        qos_pub)
